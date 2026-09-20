@@ -68,7 +68,37 @@ huấn luyện model phân loại, UI quản trị ngưỡng, triển khai đa v
 
 ---
 
-## Chạy thử
+## Cắm vào ứng dụng có sẵn
+
+Dựng proxy:
+
+```bash
+docker build -t tokengate . && docker run -p 8787:8787   -e JEV_API_KEY=...   -e UPSTREAM_URL=https://api.openai.com/v1/chat/completions   tokengate
+```
+
+Rồi sửa **đúng một dòng** trong ứng dụng đang có:
+
+```python
+client = OpenAI(base_url="http://localhost:8787/v1")   # thay vì api.openai.com
+```
+
+Hết. Không sửa logic, không đổi SDK — `POST /v1/chat/completions` nói đúng wire format
+OpenAI, và chunk gốc được **phát lại nguyên văn** sau khi xác minh chứ không dựng lại,
+nên `id`, `usage`, `finish_reason`, `tool_calls` đều còn nguyên.
+
+Ba điều đáng biết:
+
+- **Vi phạm → `finish_reason: "content_filter"`** rồi `[DONE]`, đúng quy ước OpenAI, nên SDK
+  có sẵn xử lý được. Tốt hơn cắt socket giữa chừng.
+- **`tool_calls` cũng bị soi.** Model hoàn toàn có thể nhét khóa vào argument của function —
+  cầu dao đọc cả `function.arguments`, không chỉ `content`.
+- **`stream: false` thì gom cả response kiểm một lần.** Không có mắt người đọc dần thì không
+  có gì để chặn trước, nên đi đường rẻ.
+
+Không set `UPSTREAM_KEY` thì proxy chuyển tiếp header `Authorization` của client — dùng được
+cho nhiều tenant mà proxy không cần giữ khóa nào.
+
+## Chạy thử dashboard
 
 ```bash
 npm install
@@ -222,7 +252,9 @@ UPSTREAM_URL=https://api.openai.com/v1/chat/completions UPSTREAM_KEY=sk-... npm 
 | `bench.js` | Benchmark dùng chung cho CLI và `/api/bench` |
 | `server.js` | SSE `/api/stream`, `/api/bench`, `/api/engines`, `/api/scenarios` + static |
 | `public/` | Dashboard split-screen: stream, đồng hồ latency, đèn tiêu chí, đồ thị, bảng so sánh |
-| `test.js` | Self-check bằng `assert`, không framework |
+| `proxy.js` | `POST /v1/chat/completions` tương thích OpenAI; phát lại chunk gốc nguyên văn |
+| `test.js` | Self-check lõi bằng `assert`, không framework |
+| `test-proxy.js` | Test tích hợp: dựng upstream OpenAI giả, gọi proxy qua HTTP thật |
 
 Phụ thuộc duy nhất là `@anthropic-ai/sdk` (cho engine `claude`). Phần lõi — buffer, cầu dao,
 server, dashboard — không dùng thư viện ngoài nào.
@@ -237,13 +269,16 @@ server, dashboard — không dùng thư viện ngoài nào.
 - Vi phạm chỉ bị chặn nếu phát hiện được trong lúc còn nằm trong buffer. Cửa sổ càng nhỏ,
   độ trễ cảm nhận càng thấp nhưng ngữ cảnh cho bộ đánh giá càng ít — `WINDOW_SIZE` là núm
   vặn cho đánh đổi đó.
-- Proxy chưa có auth và rate-limit. Đừng đặt ra ngoài localhost khi chưa thêm.
+- Proxy chưa có auth và rate-limit — nên đặt sau API gateway sẵn có của bạn, đừng phơi
+  thẳng ra ngoài. Chuyển tiếp `Authorization` lên upstream thì có, nhưng nó không xác thực
+  chính client gọi vào proxy.
+- Tiêu chí còn hardcode trong `criteria.js`, chưa cấu hình được từ ngoài.
 
 ## Hướng phát triển
 
-- `POST /v1/chat/completions` đúng wire format OpenAI (gồm buffer `tool_calls`) để cắm được
-  vào ứng dụng có sẵn chỉ bằng đổi `base_url`.
-- File `tokengate.yaml` để khai tiêu chí riêng, không phải sửa `criteria.js`.
+- File `tokengate.yaml` để khai tiêu chí riêng, không phải sửa `criteria.js` — hiện tiêu chí
+  vẫn nằm cứng trong source, đây là rào cản lớn nhất để người khác dùng được.
+- Bộ eval 200–500 mẫu có nhãn để biết tỉ lệ chặn nhầm thật.
 - Đặt proxy cùng region với bộ đánh giá để kiểm chứng KPI 35ms trong điều kiện hạ tầng đúng.
 - Đo P50/P95/P99 trên tập tấn công thật thay vì 5 kịch bản dựng sẵn.
 - Ngưỡng theo từng tiêu chí điều chỉnh được lúc chạy, kèm chế độ chỉ gắn cờ cho tiêu chí nhẹ.

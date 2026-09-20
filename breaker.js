@@ -1,6 +1,10 @@
 // Core: Sliding Buffer + Stream Switch Controller (mục 2.1).
 
 export const BLOCK_PAYLOAD = { status: 'blocked', reason: 'policy_violation' };
+
+// Item của source: chuỗi thuần (demo), hoặc { text, raw } khi proxy cần giữ
+// nguyên chunk gốc để phát lại đúng từng byte sau khi đã xác minh.
+const textOf = (item) => (typeof item === 'string' ? item : item?.text ?? '');
 const REPLACEMENT = '[Nội dung đã được thay thế: phản hồi chứa cam kết chưa được ủy quyền.]';
 
 export function percentile(xs, p) {
@@ -81,13 +85,13 @@ export async function runCircuitBreaker({
 
   const dispatch = () => {
     const chunk = pending.splice(0, Math.min(pending.length, maxChunk));
-    const text = chunk.join('');
+    const text = chunk.map(textOf).join('');
     const input = recent.join('') + text;
     // Ngữ cảnh chạy theo lô đã GỬI ĐI, không theo lô đã phát hành — lô trước tuy
     // chưa xác minh vẫn là ngữ cảnh đúng để chấm lô sau; trượt thì bỏ cả cụm.
-    recent.push(...chunk);
+    recent.push(...chunk.map(textOf));
     if (recent.length > lookback) recent.splice(0, recent.length - lookback);
-    inflight.push({ text, promise: evaluate(input) });
+    inflight.push({ text, chunk, promise: evaluate(input) });
   };
 
   let tripped = null;
@@ -101,7 +105,7 @@ export async function runCircuitBreaker({
       continue;
     }
 
-    const { text, promise } = inflight.shift();
+    const { text, chunk, promise } = inflight.shift();
     const v = await promise;
     evalCount++;
     latencies.push(v.latencyMs);
@@ -110,7 +114,7 @@ export async function runCircuitBreaker({
     if (v.tripped) { tripped = v.tripped; break; } // lô này chưa bao giờ rời proxy
 
     released += text;
-    emit({ type: 'token', text });
+    emit({ type: 'token', text, chunk }); // `chunk` = item gốc, proxy phát lại nguyên văn
   }
 
   stop = true;
@@ -172,7 +176,8 @@ export async function runTraditionalGuardrail({
     })());
   };
 
-  for await (const token of source) {
+  for await (const item of source) {
+    const token = textOf(item);
     released += token;
     emit({ type: 'token', text: token });
     if (leakStart === null) {

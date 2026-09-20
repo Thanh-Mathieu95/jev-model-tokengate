@@ -5,6 +5,7 @@ import { evaluate } from './evaluator.js';
 import { runCircuitBreaker, runTraditionalGuardrail } from './breaker.js';
 import { openStream, SCENARIOS } from './upstream.js';
 import { runBench, summarise, ready, ENGINES } from './bench.js';
+import { handleChatCompletions } from './proxy.js';
 
 const PORT = Number(process.env.PORT || 8787);
 const WINDOW = Number(process.env.WINDOW_SIZE || 8);
@@ -92,6 +93,13 @@ async function handleStream(req, res, url) {
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
+  // Đường proxy thật: ứng dụng có sẵn chỉ cần trỏ base_url vào đây.
+  if (url.pathname === '/v1/chat/completions') {
+    return handleChatCompletions(req, res, {
+      engine: url.searchParams.get('engine') || process.env.SCB_ENGINE || 'auto',
+      gateOpts: { windowSize: WINDOW, maxChunk: MAX_CHUNK, lookback: LOOKBACK, depth: DEPTH }
+    });
+  }
   if (url.pathname === '/api/stream') return handleStream(req, res, url);
   if (url.pathname === '/api/bench') return handleBench(req, res, url);
   if (url.pathname === '/api/engines') {
@@ -119,5 +127,7 @@ server.on('error', (err) => {
 server.listen(PORT, () => {
   const mode = process.env.UPSTREAM_URL ? `proxy → ${process.env.UPSTREAM_URL}` : 'mock LLM';
   const engine = process.env.JEV_API_KEY ? 'Jev API' : 'local heuristic';
-  console.log(`SCB dashboard: http://localhost:${PORT}  [${mode} | evaluator: ${engine} | window: ${WINDOW}]`);
+  console.log(`tokengate dashboard : http://localhost:${PORT}`);
+  console.log(`tokengate proxy     : http://localhost:${PORT}/v1  (trỏ base_url vào đây)`);
+  console.log(`[${mode} | evaluator: ${engine} | window: ${WINDOW}]`);
 });

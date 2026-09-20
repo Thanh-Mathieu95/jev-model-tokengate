@@ -5,7 +5,7 @@
   "description": "Inline semantic guardrail cho LLM streaming: chặn token vi phạm trước khi nó chạm màn hình.",
   "scripts": {
     "start": "node --env-file-if-exists=.env server.js",
-    "test": "node --env-file-if-exists=.env test.js"
+    "test": "node --env-file-if-exists=.env test.js && node --env-file-if-exists=.env test-proxy.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.127.0"
