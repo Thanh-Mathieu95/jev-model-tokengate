@@ -89,7 +89,7 @@ export async function runCircuitBreaker({ source, evaluate, emit, windowSize = 8
  * Mọi ký tự vi phạm hiển thị trong khoảng trễ đó là leak đã xảy ra.
  */
 export async function runTraditionalGuardrail({
-  source, evaluate, emit, windowSize = 8, guardrailDelayMs = 1200
+  source, evaluate, emit, windowSize = 8, guardrailDelayMs = 1200, probe = evaluate
 }) {
   const latencies = [];
   let released = '';
@@ -114,8 +114,9 @@ export async function runTraditionalGuardrail({
     released += token;
     emit({ type: 'token', text: token });
     if (leakStart === null) {
-      const probe = await evaluate(released); // chỉ để đo, không tác động luồng
-      if (probe.tripped) leakStart = released.length;
+      // Chỉ để đo mốc rò rỉ, không tác động luồng -> dùng bộ dò rẻ, đừng đốt quota engine ngoài.
+      const p = await probe(released);
+      if (p.tripped) leakStart = released.length;
     }
     if (++sinceCheck >= windowSize) { sinceCheck = 0; schedule(released); }
     if (verdict) break; // lệnh xóa vừa về -> mới dừng được, muộn mất rồi

@@ -11,6 +11,13 @@ LLM ──stream──► [ sliding buffer ] ──► [ gate ] ──► client
                                     chặn tại đây
 ```
 
+![tokengate race benchmark](docs/race.png)
+
+Cùng một prompt tấn công, hai kiến trúc chạy song song. **Trái (hậu kiểm):** khóa API
+`sk-proj-...` và `DB_PASSWORD` hiện đầy đủ trên màn hình, 2.98 giây sau mới có thông báo
+"Nội dung đã bị xóa" — 173 ký tự đã lộ. **Phải (tokengate):** luồng ngắt ngay trong buffer,
+**0 ký tự rò rỉ**.
+
 ---
 
 ## Mục tiêu dự án
@@ -46,7 +53,7 @@ bản chất so với hậu kiểm, nơi mỗi mili-giây trễ là thêm một 
 | **Zero Leakage** — token nhạy cảm hiển thị trên UI | 0 | **0** trên 5 kịch bản × 3 engine | ✅ |
 | **Schema Reliability** — phản hồi kiểm duyệt đúng cấu trúc | 100% | **100%** (Jev: noul 0–1; Claude: strict tool use) | ✅ |
 | **Phân loại đúng** trên bộ kịch bản | — | **5/5** cả ba engine | ✅ |
-| **Inline Interception Latency** | ≤ 35ms/lượt | **286ms** (Jev, qua internet công cộng) | ❌ |
+| **Inline Interception Latency** | ≤ 35ms/lượt | **~300ms** (Jev, qua internet công cộng; đo lặp 277–345ms) | ❌ |
 
 Về KPI độ trễ, nói thẳng: **không đạt, và không đạt được bằng cách tối ưu code.** Đo tách bạch
 cho thấy compute phía Jev chỉ ~79ms, còn ~190ms là RTT mạng từ VN tới endpoint. Muốn chạm 35ms
@@ -93,18 +100,30 @@ so với `threshold`. Chọn bằng dropdown **Engine B**, tham số `?engine=`,
 | Engine | Cơ chế | p50 trung vị | Đúng | Rò rỉ |
 |---|---|---|---|---|
 | `local` | regex | **0.03 ms** | 5/5 | 0 |
-| `jev` | TypeSafe Jev, latent space, 1 call cho cả 5 tiêu chí | **322 ms** | 5/5 | 0 |
+| `jev` | TypeSafe Jev, latent space, 1 call cho cả 5 tiêu chí | **308 ms** | 5/5 | 0 |
 | `claude` (haiku-4-5) | LLM guardrail, strict tool use | **1 554 ms** | 5/5 | 0 |
-| `claude` (opus-5) | LLM guardrail, strict tool use | **3 014 ms** | 5/5* | 0 |
+| `claude` (opus-5) | LLM guardrail, strict tool use | **2 746 ms** | 5/5* | 0 |
 
 `local` là fallback, không hiểu ngữ nghĩa — nó tồn tại để demo chạy offline và để hệ thống
 không fail-open khi engine ngoài chết.
+
+![so sánh engine](docs/bench.png)
+
+Bảng trên là ảnh chụp thật của một lượt chạy (nút **⚖ So mọi engine**), 15 lượt = 3 engine × 5
+kịch bản — các số trong bảng phía trên lấy từ chính lượt đó. Độ trễ engine mạng dao động vài
+chục ms giữa các lần chạy; hàng `claude` (haiku-4-5) đo ở lượt riêng nên không có trong ảnh.
+
+Điều đáng nhìn nhất: cột *Rò rỉ* xanh hết ở cả ba engine, dù p50 chênh nhau gần 100 000 lần
+(0.03ms so với 2 746ms). Đó chính là luận điểm kiến trúc, và đây là số đo chứng minh nó.
 
 ### Phát hiện đáng chú ý: guardrail tự từ chối
 
 `*` ở dòng Opus 5: trên kịch bản `harmful`, Claude trả `stop_reason: "refusal"` (category
 `cyber`) — bộ phân loại an toàn của chính nó chặn cả việc **đánh giá** nội dung khai thác
 zero-day. Guardrail rơi về heuristic cục bộ; ô đó đúng là nhờ fallback đỡ, không nhờ Claude.
+
+Trong ảnh trên, dòng đó là ô cam duy nhất: cột *Đã chạy thật* ghi `claude+local` thay vì
+`claude`, và bảng tổng kết ghi claude *Phải fallback: 1*.
 
 Đây là rủi ro hệ thống khi lấy LLM đa dụng làm kiểm duyệt: **nội dung càng nguy hiểm, engine
 càng dễ bỏ chạy** — đúng lúc cần nó nhất. Model phân loại chuyên dụng (Jev) và model nhỏ

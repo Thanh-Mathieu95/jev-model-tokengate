@@ -72,7 +72,10 @@ async function handleStream(req, res, url) {
     if (arch === 'scb') {
       await runCircuitBreaker({ ...common, abortUpstream: () => ctl.abort() });
     } else {
-      await runTraditionalGuardrail({ ...common, guardrailDelayMs });
+      await runTraditionalGuardrail({
+        ...common, guardrailDelayMs,
+        probe: (t) => evaluate(t, 'local')
+      });
     }
   } catch (err) {
     if (!ctl.signal.aborted) emit({ type: 'error', message: String(err.message || err) });
