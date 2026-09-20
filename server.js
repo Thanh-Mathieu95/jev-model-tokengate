@@ -8,6 +8,10 @@ import { runBench, summarise, ready, ENGINES } from './bench.js';
 
 const PORT = Number(process.env.PORT || 8787);
 const WINDOW = Number(process.env.WINDOW_SIZE || 8);
+// Ba núm vặn đánh đổi độ trễ / chi phí / độ chính xác — xem README.
+const MAX_CHUNK = Number(process.env.MAX_CHUNK || WINDOW * 4);
+const LOOKBACK = Number(process.env.LOOKBACK || WINDOW * 2);
+const DEPTH = Number(process.env.PIPELINE_DEPTH || 2);
 const PUBLIC = fileURLToPath(new URL('./public/', import.meta.url));
 
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css' };
@@ -66,7 +70,10 @@ async function handleStream(req, res, url) {
   };
 
   const source = openStream(scenario, SCENARIOS[scenario]?.prompt, { signal: ctl.signal });
-  const common = { source, evaluate: (t) => evaluate(t, engine), emit, windowSize: WINDOW };
+  const common = {
+    source, evaluate: (t) => evaluate(t, engine), emit,
+    windowSize: WINDOW, maxChunk: MAX_CHUNK, lookback: LOOKBACK, depth: DEPTH
+  };
 
   try {
     if (arch === 'scb') {

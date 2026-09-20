@@ -94,6 +94,31 @@ await t('sliding window · token phát hành theo lô, không nhỏ giọt', asy
   assert.ok(batches.length <= Math.ceil(total / 8), `phát hành ${batches.length} lô / ${total} token`);
 });
 
+// 8. Chi phí streaming: không gửi lại cả bài, và gộp lô khi evaluator chậm.
+//    Đây là thứ quyết định dùng được hay không trên câu trả lời dài — khoá lại.
+await t('chi phí · không bùng theo bình phương độ dài câu trả lời', async () => {
+  const N = 400;
+  const toks = Array.from({ length: N }, (_, i) => ' từ' + i);
+  const raw = toks.join('').length;
+  const slow = (ms) => async (text) => {
+    sent.push(text.length);
+    await new Promise((r) => setTimeout(r, ms));
+    return { results: [], tripped: null, latencyMs: ms, engine: 'stub' };
+  };
+  let sent = [];
+  async function* src() { for (const x of toks) yield x; }
+
+  await runCircuitBreaker({ source: src(), evaluate: slow(0), emit: () => {}, windowSize: 8 });
+  const total = sent.reduce((a, b) => a + b, 0);
+  assert.ok(total < raw * 5, `gửi ${total} ký tự cho bài ${raw} ký tự - nghi ngờ lại gửi cả bài`);
+  assert.ok(Math.max(...sent) < 400, `một lượt gửi tới ${Math.max(...sent)} ký tự - cửa sổ không còn bị chặn trên`);
+
+  // Evaluator chậm -> lô phải tự to ra, số lượt gọi phải giảm hẳn.
+  sent = [];
+  await runCircuitBreaker({ source: src(), evaluate: slow(30), emit: () => {}, windowSize: 8 });
+  assert.ok(sent.length < N / 8 / 2, `${sent.length} lượt gọi - không thấy gộp lô khi evaluator chậm`);
+});
+
 // 8. Smoke test Jev thật (opt-in: cần mạng + credit).
 if (process.env.SCB_TEST_JEV === '1' && JEV_KEY) {
   process.env.JEV_API_KEY = JEV_KEY;

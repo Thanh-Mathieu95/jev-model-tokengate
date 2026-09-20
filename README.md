@@ -132,6 +132,39 @@ càng dễ bỏ chạy** — đúng lúc cần nó nhất. Model phân loại ch
 
 ---
 
+## Chi phí trên câu trả lời dài
+
+Đây là chỗ một guardrail streaming sống hoặc chết, và nó không lộ ra ở demo ngắn.
+Gọi evaluator lặp lại trên văn bản đang dài ra rất dễ thành chi phí bậc hai.
+
+tokengate làm hai việc để tránh:
+
+1. **Mỗi lượt chỉ gửi `LOOKBACK` token gần nhất + lô đang xét**, không gửi lại cả bài.
+2. **Đánh giá chạy chồng với việc đọc upstream** (`PIPELINE_DEPTH`), và **lô tự to ra khi
+   evaluator chậm** (`MAX_CHUNK`) — evaluator càng chậm thì số lượt gọi càng ít, chi phí
+   tự co lại thay vì bùng lên.
+
+Đo trên câu trả lời 400 token, sinh 40ms/token, baseline đo thật 19.3s:
+
+| evaluator | | lượt gọi | ký tự gửi đi | độ trễ cộng thêm |
+|---|---|---|---|---|
+| Jev 300ms | ngây thơ | 50 | 56 278 (24.6x bài gốc) | +0.30s |
+| Jev 300ms | **tokengate** | 50 | **6 726 (2.9x)** | **+0.11s** |
+| Opus 2 700ms | ngây thơ | 50 | 56 278 (24.6x) | +116.51s |
+| Opus 2 700ms | **tokengate** | **15** | **3 522 (1.5x)** | **+2.78s** |
+
+("ngây thơ" = gửi toàn bộ ngữ cảnh, không gộp lô, không pipeline — mô phỏng bằng
+`maxChunk=windowSize, lookback=Infinity, depth=1`. Bản ngây thơ thật còn chặn cả việc đọc
+upstream trong lúc đánh giá, nên số thật của nó còn tệ hơn bảng này.)
+
+Điểm cần thấy: với Jev thì cổng gần như miễn phí. Với evaluator chậm gấp 9 lần, nó vẫn
+dùng được — **+2.78s thay vì +116s**. Đó là điều làm kiến trúc này chịu được engine kém.
+
+**Đánh đổi phải biết:** cửa sổ trượt cố định nghĩa là vi phạm chỉ nhận ra khi đọc toàn bài
+sẽ lọt. Tăng `LOOKBACK` nếu chính sách của bạn cần ngữ cảnh xa — đổi lại chi phí tăng.
+
+---
+
 ## Bộ tiêu chí
 
 | Mã | Tiêu chí | Hành động khi kích hoạt |
@@ -155,7 +188,10 @@ fail âm thầm.
 | Biến | Mặc định | Ghi chú |
 |---|---|---|
 | `PORT` | `8787` | |
-| `WINDOW_SIZE` | `8` | token đệm mỗi chu kỳ đánh giá |
+| `WINDOW_SIZE` | `8` | số token tối thiểu gom lại trước mỗi lượt đánh giá |
+| `MAX_CHUNK` | `WINDOW_SIZE × 4` | trần token mỗi lượt; evaluator chậm → lô to hơn, gọi ít hơn |
+| `LOOKBACK` | `WINDOW_SIZE × 2` | token gần nhất gửi kèm làm ngữ cảnh |
+| `PIPELINE_DEPTH` | `2` | số lượt đánh giá chạy chồng nhau (commit vẫn theo thứ tự) |
 | `SCB_ENGINE` | `auto` | `auto` = Jev nếu có key, không thì local |
 | `JEV_API_KEY` | — | bật engine `jev` |
 | `JEV_URL` | `https://api.typesafe.ai/v1/systemone` | |
@@ -205,6 +241,9 @@ server, dashboard — không dùng thư viện ngoài nào.
 
 ## Hướng phát triển
 
+- `POST /v1/chat/completions` đúng wire format OpenAI (gồm buffer `tool_calls`) để cắm được
+  vào ứng dụng có sẵn chỉ bằng đổi `base_url`.
+- File `tokengate.yaml` để khai tiêu chí riêng, không phải sửa `criteria.js`.
 - Đặt proxy cùng region với bộ đánh giá để kiểm chứng KPI 35ms trong điều kiện hạ tầng đúng.
 - Đo P50/P95/P99 trên tập tấn công thật thay vì 5 kịch bản dựng sẵn.
 - Ngưỡng theo từng tiêu chí điều chỉnh được lúc chạy, kèm chế độ chỉ gắn cờ cho tiêu chí nhẹ.

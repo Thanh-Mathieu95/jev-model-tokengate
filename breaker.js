@@ -11,63 +11,125 @@ export function percentile(xs, p) {
 
 /**
  * Kiến trúc B — tiền kiểm inline.
- * Token nằm trong buffer ở trạng thái Pending Verification; chỉ được phát hành
- * sau khi cửa sổ hiện tại All Pass. Vi phạm -> drop buffer, abort cả 2 đầu.
+ * Token nằm ở trạng thái Pending Verification; chỉ được phát hành sau khi lô
+ * hiện tại All Pass. Vi phạm -> drop buffer, abort cả 2 đầu.
  *
- * @param source    async iterable các token từ LLM upstream
- * @param evaluate  (text) => { results, tripped, latencyMs }
- * @param emit      (event) => void  — sự kiện gửi xuống client
- * @param windowSize số token đệm trước mỗi lượt đánh giá
+ * Hai tính chất quyết định chi phí, đừng bỏ khi sửa về sau:
+ *
+ *  1. Đọc upstream chạy song song với đánh giá (producer riêng). Sinh 8 token mất
+ *     ~320ms, đánh giá mất ~300ms -> độ trễ đánh giá nấp sau tốc độ sinh token
+ *     thay vì cộng dồn. Chờ kết quả rồi mới đọc tiếp là cộng dồn: 800 token = +30s.
+ *  2. Mỗi lượt chỉ gửi `lookback` token gần nhất + lô đang xét, KHÔNG gửi cả bài.
+ *     Gửi cả bài là chi phí bậc hai: 800 token -> 58.000 token input.
+ *
+ * @param source     async iterable các token từ LLM upstream
+ * @param evaluate   (text) => { results, tripped, latencyMs }
+ * @param emit       (event) => void — sự kiện gửi xuống client
+ * @param windowSize số token tối thiểu gom lại trước mỗi lượt đánh giá
+ * @param maxChunk   trần số token mỗi lượt; evaluator càng chậm lô càng to, số
+ *                   lượt gọi càng ít -> chi phí tự co lại thay vì bùng lên
+ * @param lookback   số token gần nhất gửi kèm làm ngữ cảnh
+ * @param depth      số lượt đánh giá được phép chạy chồng nhau (commit vẫn theo thứ tự)
  * @param abortUpstream () => void — hủy sinh token để tiết kiệm chi phí
  */
-export async function runCircuitBreaker({ source, evaluate, emit, windowSize = 8, abortUpstream }) {
-  const buffer = [];
+export async function runCircuitBreaker({
+  source, evaluate, emit, abortUpstream,
+  windowSize = 8,
+  maxChunk = windowSize * 4,
+  lookback = windowSize * 2,
+  depth = 2
+}) {
   const latencies = [];
   let released = '';
   let evalCount = 0;
 
-  const flush = () => {
-    if (!buffer.length) return;
-    const text = buffer.splice(0).join('');
-    released += text;
-    emit({ type: 'token', text });
-  };
+  // ponytail: cửa sổ trượt cố định. Vi phạm chỉ nhận ra khi đọc toàn bài sẽ lọt
+  // qua — nâng `lookback`, hoặc chuyển sang evaluator có trạng thái (gửi delta,
+  // server giữ ngữ cảnh) nếu cần ngữ cảnh xa.
+  const recent = [];
 
-  const check = async () => {
-    const v = await evaluate(released + buffer.join(''));
-    evalCount++;
-    latencies.push(v.latencyMs);
-    emit({ type: 'eval', latencyMs: v.latencyMs, engine: v.engine, results: v.results });
-    return v;
-  };
+  const pending = [];
+  let srcDone = false;
+  let srcError = null;
+  let stop = false;
+  let wake = null;
+  const ping = () => { const w = wake; wake = null; w?.(); };
+  const more = () => new Promise((r) => { wake = r; });
 
-  const trip = (t) => {
-    buffer.length = 0; // token pending không bao giờ rời proxy
-    abortUpstream?.();
-    if (t.action === 'replace') {
-      emit({ type: 'replaced', criterion: t, text: REPLACEMENT });
-    } else {
-      emit({ type: 'blocked', criterion: t, payload: BLOCK_PAYLOAD });
+  // Producer: hút token về liên tục, không chờ kết quả đánh giá.
+  (async () => {
+    try {
+      for await (const token of source) {
+        if (stop) break;
+        pending.push(token);
+        ping();
+      }
+    } catch (err) {
+      srcError = err;
+    } finally {
+      srcDone = true;
+      ping();
     }
-    if (t.action === 'abort+log') emit({ type: 'security_log', criterion: t, at: new Date().toISOString() });
+  })();
+
+  // Pipeline: cho phép `depth` lượt đánh giá chạy chồng nhau, nhưng COMMIT THEO
+  // THỨ TỰ. Nhờ vậy độ trễ đánh giá nấp sau tốc độ sinh token thay vì nối đuôi.
+  // Nối đuôi: mỗi chu kỳ = thời gian sinh 1 lô + thời gian đánh giá 1 lô.
+  // Chồng nhau : mỗi chu kỳ = max(hai thứ đó). Token vẫn chỉ phát hành sau khi
+  // lô của nó VÀ mọi lô trước nó đều All Pass, nên bảo đảm 0 rò rỉ không đổi.
+  const inflight = [];
+
+  const dispatch = () => {
+    const chunk = pending.splice(0, Math.min(pending.length, maxChunk));
+    const text = chunk.join('');
+    const input = recent.join('') + text;
+    // Ngữ cảnh chạy theo lô đã GỬI ĐI, không theo lô đã phát hành — lô trước tuy
+    // chưa xác minh vẫn là ngữ cảnh đúng để chấm lô sau; trượt thì bỏ cả cụm.
+    recent.push(...chunk);
+    if (recent.length > lookback) recent.splice(0, recent.length - lookback);
+    inflight.push({ text, promise: evaluate(input) });
   };
 
   let tripped = null;
-  for await (const token of source) {
-    buffer.push(token);
-    if (buffer.length < windowSize) continue;
-    const v = await check();
-    if (v.tripped) { tripped = v.tripped; break; }
-    flush();
+  while (true) {
+    while (inflight.length < depth && (pending.length >= windowSize || (srcDone && pending.length))) {
+      dispatch();
+    }
+    if (!inflight.length) {
+      if (srcDone && !pending.length) break;
+      await more();
+      continue;
+    }
+
+    const { text, promise } = inflight.shift();
+    const v = await promise;
+    evalCount++;
+    latencies.push(v.latencyMs);
+    emit({ type: 'eval', latencyMs: v.latencyMs, engine: v.engine, results: v.results });
+
+    if (v.tripped) { tripped = v.tripped; break; } // lô này chưa bao giờ rời proxy
+
+    released += text;
+    emit({ type: 'token', text });
   }
 
-  if (!tripped && buffer.length) {
-    const v = await check(); // đuôi luồng vẫn phải qua cầu dao
-    if (v.tripped) tripped = v.tripped;
-    else flush();
-  }
+  stop = true;
 
-  if (tripped) trip(tripped);
+  if (tripped) {
+    pending.length = 0;
+    inflight.length = 0; // lô đang bay cũng bị bỏ, không phát hành
+    abortUpstream?.();
+    if (tripped.action === 'replace') {
+      emit({ type: 'replaced', criterion: tripped, text: REPLACEMENT });
+    } else {
+      emit({ type: 'blocked', criterion: tripped, payload: BLOCK_PAYLOAD });
+    }
+    if (tripped.action === 'abort+log') {
+      emit({ type: 'security_log', criterion: tripped, at: new Date().toISOString() });
+    }
+  } else if (srcError) {
+    throw srcError;
+  }
 
   const stats = {
     arch: 'scb',
