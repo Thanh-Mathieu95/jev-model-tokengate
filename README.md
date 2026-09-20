@@ -2,8 +2,8 @@
 
 > Every token passes the gate before the screen.
 
-Lớp proxy đặt giữa LLM và người dùng, kiểm duyệt ngữ nghĩa **từng cửa sổ token trong lúc
-đang stream** và ngắt luồng **trước khi** token vi phạm kịp hiển thị.
+Proxy tương thích OpenAI, đặt giữa LLM và người dùng. Nó kiểm duyệt ngữ nghĩa **từng cửa sổ
+token trong lúc đang stream** và ngắt luồng **trước khi** token vi phạm kịp hiển thị.
 
 ```
 LLM ──stream──► [ sliding buffer ] ──► [ gate ] ──► client
@@ -24,26 +24,28 @@ Cùng một prompt tấn công, hai kiến trúc chạy song song. **Trái (hậ
 
 ### Vấn đề
 
-Ứng dụng LLM ngày nay stream token ra màn hình ngay khi model sinh (30–60ms/token) để giảm
+Ứng dụng LLM ngày nay stream chữ ra màn hình ngay khi model sinh (30–60ms/token) để giảm
 Time-to-First-Token. Cơ chế đó tạo một lỗ hổng không vá được bằng kiểm duyệt thông thường.
 
 Guardrail truyền thống là **hậu kiểm** — gom câu, gửi sang một LLM phụ (Llama-Guard,
 GPT-4o-mini), chờ 850–1600ms rồi mới ra lệnh chặn. Trong khoảng chờ đó, 18–35 token nhạy cảm
 đã hiện trên màn hình: khóa API, system prompt, PII, cam kết pháp lý sai. Lệnh xóa đến sau
-không cứu được gì — người dùng đã đọc, đã kịp chụp màn hình.
+không cứu được gì — người dùng đã đọc, đã kịp chụp màn hình, video ghi hình đã quay xong.
 
-**Xóa một bí mật khỏi DOM không phải là bảo mật. Không để nó tới DOM mới là.**
+Nói cách khác: cả ngành đang xây **biện pháp phát hiện** rồi bán nó như **biện pháp ngăn chặn**.
+
+> **Xóa một bí mật khỏi màn hình không phải là bảo mật. Không để nó lên màn hình mới là.**
 
 ### Giải pháp
 
 Không kiểm duyệt nhanh hơn — kiểm duyệt **trước khi phát hành**. Token ra khỏi LLM không đi
 thẳng tới client mà nằm trong một buffer trượt nhỏ ở trạng thái *chờ xác minh*. Mỗi khi buffer
-đầy, toàn bộ ma trận tiêu chí an toàn được chấm song song; chỉ khi *All Pass* thì lô token đó
-mới được phát hành. Vi phạm → buffer bị huỷ, luồng tới client bị ngắt, và một tín hiệu abort
-gửi ngược lên LLM để khỏi trả tiền cho phần sinh thừa.
+đầy, toàn bộ ma trận tiêu chí được chấm song song; chỉ khi *All Pass* thì lô token đó mới
+được thả. Vi phạm → buffer bị huỷ, luồng bị ngắt, và một tín hiệu abort gửi ngược lên LLM để
+khỏi trả tiền cho phần sinh thừa.
 
 Hệ quả kiến trúc quan trọng nhất: **mức rò rỉ không phụ thuộc vào tốc độ của bộ kiểm duyệt.**
-Engine chậm chỉ làm luồng khựng lâu hơn, không làm lọt thêm một token nào. Đây là khác biệt
+Engine chậm chỉ làm luồng khựng lâu hơn, không làm lọt thêm một token nào. Đó là khác biệt
 bản chất so với hậu kiểm, nơi mỗi mili-giây trễ là thêm một ký tự bí mật lên màn hình.
 
 ### Mục tiêu đo được, và kết quả thật
@@ -57,64 +59,75 @@ bản chất so với hậu kiểm, nơi mỗi mili-giây trễ là thêm một 
 
 Về KPI độ trễ, nói thẳng: **không đạt, và không đạt được bằng cách tối ưu code.** Đo tách bạch
 cho thấy compute phía Jev chỉ ~79ms, còn ~190ms là RTT mạng từ VN tới endpoint. Muốn chạm 35ms
-phải đặt proxy cùng region/edge node với bộ đánh giá — đúng phương án hạ tầng đã lường trước.
-Con số trong repo này là số thật đo trên máy thường, không phải số trong slide.
+phải đặt proxy cùng region/edge node với bộ đánh giá. Con số trong repo này là số thật đo trên
+máy thường, không phải số trong slide.
 
 ### Ngoài phạm vi
 
-Dự án **không** cố trở thành một guardrail production. Nó chứng minh một luận điểm kiến trúc
-và cung cấp bàn đo để kiểm chứng luận điểm đó. Cụ thể không làm: auth/rate-limit cho proxy,
-huấn luyện model phân loại, UI quản trị ngưỡng, triển khai đa vùng.
+Dự án **không** cố trở thành guardrail đa năng đặt trước mọi traffic. Nó là **van chặn cho một
+bề mặt hẹp, rủi ro cao, có người đang nhìn**. Và cần nói rõ nó không giải quyết gì:
+
+- **Không ngăn model sinh ra nội dung xấu**, chỉ ngăn nội dung đó tới màn hình.
+- **Không sửa lỗi phân quyền.** Nếu bot RAG đọc được hồ sơ nó không nên đọc, gốc rễ nằm ở tầng
+  dữ liệu. Đây là lưới an toàn cuối cùng, không phải bản vá.
+- **Không giải quyết prompt injection**, chỉ chặn một trong các hậu quả của nó.
+- **Vô dụng khi đầu ra cho máy đọc.** Không có mắt người thì gom cả response kiểm một lần rẻ hơn
+  nhiều — proxy tự đi đường đó khi `stream: false`.
 
 ---
 
 ## Cắm vào ứng dụng có sẵn
 
-Dựng proxy:
-
 ```bash
-docker build -t tokengate . && docker run -p 8787:8787   -e JEV_API_KEY=...   -e UPSTREAM_URL=https://api.openai.com/v1/chat/completions   tokengate
+docker build -t tokengate . && docker run -p 8787:8787 \
+  -e JEV_API_KEY=... \
+  -e UPSTREAM_URL=https://api.openai.com/v1/chat/completions \
+  tokengate
 ```
 
-Rồi sửa **đúng một dòng** trong ứng dụng đang có:
+Rồi sửa **đúng một dòng** trong ứng dụng đang chạy:
 
 ```python
 client = OpenAI(base_url="http://localhost:8787/v1")   # thay vì api.openai.com
 ```
 
-Hết. Không sửa logic, không đổi SDK — `POST /v1/chat/completions` nói đúng wire format
-OpenAI, và chunk gốc được **phát lại nguyên văn** sau khi xác minh chứ không dựng lại,
-nên `id`, `usage`, `finish_reason`, `tool_calls` đều còn nguyên.
+Hết. Không sửa logic, không đổi SDK. `POST /v1/chat/completions` nói đúng wire format OpenAI,
+và chunk gốc được **phát lại nguyên văn** sau khi xác minh chứ không dựng lại — nên `id`,
+`usage`, `finish_reason`, `tool_calls` đều còn nguyên.
 
 Ba điều đáng biết:
 
-- **Vi phạm → `finish_reason: "content_filter"`** rồi `[DONE]`, đúng quy ước OpenAI, nên SDK
-  có sẵn xử lý được. Tốt hơn cắt socket giữa chừng.
+- **Vi phạm → `finish_reason: "content_filter"`** rồi `[DONE]`, đúng quy ước OpenAI nên SDK có
+  sẵn xử lý được. Tốt hơn nhiều so với cắt socket giữa chừng.
 - **`tool_calls` cũng bị soi.** Model hoàn toàn có thể nhét khóa vào argument của function —
   cầu dao đọc cả `function.arguments`, không chỉ `content`.
-- **`stream: false` thì gom cả response kiểm một lần.** Không có mắt người đọc dần thì không
-  có gì để chặn trước, nên đi đường rẻ.
+- **`stream: false` đi đường rẻ:** gom cả response, kiểm một lần.
 
 Không set `UPSTREAM_KEY` thì proxy chuyển tiếp header `Authorization` của client — dùng được
-cho nhiều tenant mà proxy không cần giữ khóa nào.
+cho nhiều tenant mà proxy không giữ khóa nào.
 
-## Chạy thử dashboard
+> **Proxy chưa tự xác thực client gọi vào.** Đặt nó sau API gateway sẵn có của bạn (auth, rate
+> limit, routing), đừng phơi thẳng ra internet.
+
+---
+
+## Xem nó hoạt động
 
 ```bash
 npm install
 npm start          # http://localhost:8787
 ```
 
-Chạy được ngay không cần API key nào — mặc định dùng mock LLM và heuristic cục bộ.
-Trên dashboard có hai nút:
+Chạy được ngay không cần API key nào — mặc định dùng mock LLM và heuristic cục bộ. Dashboard
+có hai nút:
 
 - **▶ Chạy đối đầu** — cùng một prompt tấn công chạy song song qua hậu kiểm (trái) và tiền kiểm
   (phải). Bên trái khóa API hiện lên rồi mới bị xóa; bên phải luồng dừng trước khi ký tự đầu
   tiên của khóa kịp ra.
-- **⚖ So mọi engine** — chạy toàn bộ benchmark ngay trên server, kết quả đổ về bảng theo từng dòng.
+- **⚖ So mọi engine** — chạy toàn bộ benchmark ngay trên server, kết quả đổ về bảng từng dòng.
 
 ```bash
-npm test                   # self-check (offline, tất định, không tốn credit)
+npm test                   # lõi + config + proxy (offline, tất định, không tốn credit)
 SCB_TEST_JEV=1 npm test    # thêm smoke test gọi Jev thật
 node bench.js              # benchmark bản CLI
 node bench.js local claude # chỉ so 2 engine được nêu
@@ -125,7 +138,7 @@ node bench.js local claude # chỉ so 2 engine được nêu
 ## Ba engine kiểm duyệt
 
 Cùng một cầu dao, thay engine không đổi một dòng nào ở tầng luồng — cả ba trả về 5 score 0–1
-so với `threshold`. Chọn bằng dropdown **Engine B**, tham số `?engine=`, hoặc biến `SCB_ENGINE`.
+so với `threshold`. Chọn bằng dropdown **Engine B**, tham số `?engine=`, hoặc `SCB_ENGINE`.
 
 | Engine | Cơ chế | p50 trung vị | Đúng | Rò rỉ |
 |---|---|---|---|---|
@@ -139,11 +152,10 @@ không fail-open khi engine ngoài chết.
 
 ![so sánh engine](docs/bench.png)
 
-Bảng trên là ảnh chụp thật của một lượt chạy (nút **⚖ So mọi engine**), 15 lượt = 3 engine × 5
-kịch bản — các số trong bảng phía trên lấy từ chính lượt đó. Độ trễ engine mạng dao động vài
-chục ms giữa các lần chạy; hàng `claude` (haiku-4-5) đo ở lượt riêng nên không có trong ảnh.
+Bảng trên là ảnh chụp thật một lượt chạy (nút **⚖ So mọi engine**), 15 lượt = 3 engine × 5
+kịch bản. Hàng `claude` (haiku-4-5) đo ở lượt riêng nên không có trong ảnh.
 
-Điều đáng nhìn nhất: cột *Rò rỉ* xanh hết ở cả ba engine, dù p50 chênh nhau gần 100 000 lần
+Điều đáng nhìn nhất: cột *Rò rỉ* xanh hết ở cả ba engine, dù p50 chênh nhau **gần 100 000 lần**
 (0.03ms so với 2 746ms). Đó chính là luận điểm kiến trúc, và đây là số đo chứng minh nó.
 
 ### Phát hiện đáng chú ý: guardrail tự từ chối
@@ -152,27 +164,27 @@ chục ms giữa các lần chạy; hàng `claude` (haiku-4-5) đo ở lượt r
 `cyber`) — bộ phân loại an toàn của chính nó chặn cả việc **đánh giá** nội dung khai thác
 zero-day. Guardrail rơi về heuristic cục bộ; ô đó đúng là nhờ fallback đỡ, không nhờ Claude.
 
-Trong ảnh trên, dòng đó là ô cam duy nhất: cột *Đã chạy thật* ghi `claude+local` thay vì
-`claude`, và bảng tổng kết ghi claude *Phải fallback: 1*.
+Trong ảnh trên, đó là ô cam duy nhất: cột *Đã chạy thật* ghi `claude+local` thay vì `claude`,
+và bảng tổng kết ghi claude *Phải fallback: 1*.
 
 Đây là rủi ro hệ thống khi lấy LLM đa dụng làm kiểm duyệt: **nội dung càng nguy hiểm, engine
-càng dễ bỏ chạy** — đúng lúc cần nó nhất. Model phân loại chuyên dụng (Jev) và model nhỏ
-(Haiku 4.5) không có hành vi này. Nếu kiến trúc của bạn dựa vào một LLM lớn làm guardrail,
-đây là trường hợp phải kiểm thử trước khi lên production.
+càng dễ bỏ chạy** — đúng lúc cần nhất, và bỏ chạy im lặng nếu hệ thống không bắt lỗi fallback.
+Model phân loại chuyên dụng (Jev) và model nhỏ (Haiku 4.5) không có hành vi này.
 
 ---
 
 ## Chi phí trên câu trả lời dài
 
-Đây là chỗ một guardrail streaming sống hoặc chết, và nó không lộ ra ở demo ngắn.
-Gọi evaluator lặp lại trên văn bản đang dài ra rất dễ thành chi phí bậc hai.
+Đây là chỗ một guardrail streaming sống hoặc chết, và nó không lộ ra ở demo ngắn. Gọi
+evaluator lặp lại trên văn bản đang dài ra rất dễ thành chi phí bậc hai.
 
-tokengate làm hai việc để tránh:
+tokengate làm ba việc để tránh:
 
 1. **Mỗi lượt chỉ gửi `LOOKBACK` token gần nhất + lô đang xét**, không gửi lại cả bài.
-2. **Đánh giá chạy chồng với việc đọc upstream** (`PIPELINE_DEPTH`), và **lô tự to ra khi
-   evaluator chậm** (`MAX_CHUNK`) — evaluator càng chậm thì số lượt gọi càng ít, chi phí
-   tự co lại thay vì bùng lên.
+2. **Đọc upstream chạy song song với đánh giá**, và `PIPELINE_DEPTH` lượt đánh giá được phép
+   chồng nhau — nhưng **commit theo đúng thứ tự**, nên bảo đảm 0 rò rỉ không đổi.
+3. **Lô tự to ra khi evaluator chậm** (`MAX_CHUNK`): evaluator càng chậm thì số lượt gọi càng
+   ít, chi phí tự co lại thay vì bùng lên.
 
 Đo trên câu trả lời 400 token, sinh 40ms/token, baseline đo thật 19.3s:
 
@@ -187,11 +199,11 @@ tokengate làm hai việc để tránh:
 `maxChunk=windowSize, lookback=Infinity, depth=1`. Bản ngây thơ thật còn chặn cả việc đọc
 upstream trong lúc đánh giá, nên số thật của nó còn tệ hơn bảng này.)
 
-Điểm cần thấy: với Jev thì cổng gần như miễn phí. Với evaluator chậm gấp 9 lần, nó vẫn
-dùng được — **+2.78s thay vì +116s**. Đó là điều làm kiến trúc này chịu được engine kém.
+Điểm cần thấy: với Jev thì cổng gần như miễn phí. Với evaluator chậm gấp 9 lần, nó **vẫn dùng
+được** — +2.78s thay vì +116s. Đó là điều làm kiến trúc này chịu được engine kém.
 
-**Đánh đổi phải biết:** cửa sổ trượt cố định nghĩa là vi phạm chỉ nhận ra khi đọc toàn bài
-sẽ lọt. Tăng `LOOKBACK` nếu chính sách của bạn cần ngữ cảnh xa — đổi lại chi phí tăng.
+**Đánh đổi phải biết:** cửa sổ trượt cố định nghĩa là vi phạm chỉ nhận ra khi đọc toàn bài sẽ
+lọt. Tăng `LOOKBACK` nếu chính sách của bạn cần ngữ cảnh xa — đổi lại chi phí tăng.
 
 ---
 
@@ -241,9 +253,8 @@ vào file của bạn):
 
 Có file config thì bộ mặc định bị **thay hoàn toàn**, không cộng dồn.
 
-**Config sai thì server không khởi động.** Cố tình như vậy: im lặng bỏ qua một tiêu chí
-hỏng nghĩa là thủng một lỗ bảo mật mà không ai biết. Lỗi báo rõ file nào, tiêu chí thứ mấy,
-thiếu gì:
+**Config sai thì server không khởi động.** Cố tình như vậy: im lặng bỏ qua một tiêu chí hỏng
+nghĩa là thủng một lỗ bảo mật mà không ai biết. Lỗi báo rõ file nào, tiêu chí thứ mấy, thiếu gì:
 
 ```
 [tokengate] không khởi động được: policy.json — tiêu chí #2 (pii): thiếu "when"
@@ -274,12 +285,6 @@ fail âm thầm.
 | `CLAUDE_TIMEOUT_MS` | `20000` | |
 | `UPSTREAM_URL` / `UPSTREAM_KEY` / `UPSTREAM_MODEL` | — | không set → mock LLM |
 
-Đặt trước một endpoint OpenAI-compatible thật (OpenAI / vLLM / Anthropic compat):
-
-```bash
-UPSTREAM_URL=https://api.openai.com/v1/chat/completions UPSTREAM_KEY=sk-... npm start
-```
-
 ---
 
 ## Cấu trúc mã
@@ -287,39 +292,39 @@ UPSTREAM_URL=https://api.openai.com/v1/chat/completions UPSTREAM_KEY=sk-... npm 
 | File | Vai trò |
 |---|---|
 | `breaker.js` | Sliding buffer + stream switch controller; kèm bản dựng lại kiến trúc hậu kiểm để đo đối đầu |
+| `proxy.js` | `POST /v1/chat/completions` tương thích OpenAI; phát lại chunk gốc nguyên văn |
 | `criteria.js` | Tiêu chí mặc định + nạp và kiểm tra `tokengate.config.json` |
 | `evaluator.js` | Chọn và gọi engine; mọi lỗi/timeout đều fallback cục bộ (fail-closed) |
 | `claude-guard.js` | Engine Claude qua Anthropic SDK, strict tool use để ép đúng schema |
-| `upstream.js` | Mock LLM 30–60ms/token + reverse proxy SSE cho endpoint thật |
+| `upstream.js` | Mock LLM 30–60ms/token + đọc SSE của endpoint thật |
 | `bench.js` | Benchmark dùng chung cho CLI và `/api/bench` |
-| `server.js` | SSE `/api/stream`, `/api/bench`, `/api/engines`, `/api/scenarios` + static |
+| `server.js` | Route proxy + SSE demo + static |
+| `startup-guard.js` | Đổi stack trace lúc nạp config thành một dòng đọc được |
 | `public/` | Dashboard split-screen: stream, đồng hồ latency, đèn tiêu chí, đồ thị, bảng so sánh |
-| `proxy.js` | `POST /v1/chat/completions` tương thích OpenAI; phát lại chunk gốc nguyên văn |
-| `test.js` | Self-check lõi bằng `assert`, không framework |
-| `test-config.js` | Test cho việc nạp chính sách: config sai phải ném, không được nuốt |
-| `test-proxy.js` | Test tích hợp: dựng upstream OpenAI giả, gọi proxy qua HTTP thật |
+| `test.js` / `test-config.js` / `test-proxy.js` | Self-check bằng `assert`, không framework |
 
 Phụ thuộc duy nhất là `@anthropic-ai/sdk` (cho engine `claude`). Phần lõi — buffer, cầu dao,
-server, dashboard — không dùng thư viện ngoài nào.
+proxy, server, dashboard — không dùng thư viện ngoài nào.
 
 ---
 
 ## Giới hạn đã biết
 
-- `local` là regex, không phải hiểu ngữ nghĩa. Nó là lưới an toàn, không phải bộ kiểm duyệt.
-- Ngưỡng `threshold` cố định trong `criteria.js`, chưa có UI tinh chỉnh. Hạ ngưỡng để giảm
-  false positive là đánh đổi phải đo trên dữ liệu thật, không đoán.
-- Vi phạm chỉ bị chặn nếu phát hiện được trong lúc còn nằm trong buffer. Cửa sổ càng nhỏ,
-  độ trễ cảm nhận càng thấp nhưng ngữ cảnh cho bộ đánh giá càng ít — `WINDOW_SIZE` là núm
-  vặn cho đánh đổi đó.
-- Proxy chưa có auth và rate-limit — nên đặt sau API gateway sẵn có của bạn, đừng phơi
-  thẳng ra ngoài. Chuyển tiếp `Authorization` lên upstream thì có, nhưng nó không xác thực
-  chính client gọi vào proxy.
+- **Chưa biết tỉ lệ chặn nhầm thật.** 5 kịch bản không phải eval set. Một guardrail chặn nhầm
+  1% câu trả lời hợp lệ — cụt giữa chừng — thì tệ hơn là không có. Đây là con số quan trọng
+  nhất còn thiếu, và nó quan trọng hơn latency.
+- **`local` là regex, không phải hiểu ngữ nghĩa.** Nó là lưới an toàn, không phải bộ kiểm duyệt.
+- **Cửa sổ trượt cố định**: vi phạm chỉ nhận ra khi đọc toàn bài sẽ lọt. `LOOKBACK` là núm vặn.
+- **Proxy chưa có auth và rate-limit**, phải đặt sau API gateway sẵn có.
+- **KPI 35ms chưa kiểm chứng được** vì chưa có hạ tầng cùng region với bộ đánh giá.
 
 ## Hướng phát triển
 
-- Bộ eval 200–500 mẫu có nhãn để biết tỉ lệ chặn nhầm thật — đây giờ là việc quan trọng nhất
-  còn lại, và nó quan trọng hơn latency.
+- Bộ eval 200–500 mẫu có nhãn (một nửa vô hại, một nửa tấn công) để đo tỉ lệ chặn nhầm.
 - Đặt proxy cùng region với bộ đánh giá để kiểm chứng KPI 35ms trong điều kiện hạ tầng đúng.
-- Đo P50/P95/P99 trên tập tấn công thật thay vì 5 kịch bản dựng sẵn.
-- Ngưỡng theo từng tiêu chí điều chỉnh được lúc chạy, kèm chế độ chỉ gắn cờ cho tiêu chí nhẹ.
+- Đóng gói thành filter cho LLM gateway sẵn có (LiteLLM, Portkey) thay vì bắt dựng thêm service.
+- Ngưỡng điều chỉnh được lúc chạy, kèm chế độ chỉ gắn cờ cho tiêu chí nhẹ.
+
+## Giấy phép
+
+MIT — xem [LICENSE](LICENSE).
