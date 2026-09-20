@@ -197,6 +197,8 @@ sẽ lọt. Tăng `LOOKBACK` nếu chính sách của bạn cần ngữ cảnh x
 
 ## Bộ tiêu chí
 
+Mặc định có 5 tiêu chí, cả ba engine đọc chung một khai báo:
+
 | Mã | Tiêu chí | Hành động khi kích hoạt |
 |---|---|---|
 | CRIT-01 | System Prompt Exfiltration | ngắt luồng |
@@ -205,8 +207,47 @@ sẽ lọt. Tăng `LOOKBACK` nếu chính sách của bạn cần ngữ cảnh x
 | CRIT-04 | PII Disclosure | ngắt luồng |
 | CRIT-05 | Harmful/Dangerous Instructions | ngắt luồng + ghi log bảo mật |
 
-Mỗi tiêu chí khai báo một lần trong `criteria.js` kèm mô tả ngữ nghĩa, ngưỡng, và heuristic
-dự phòng — cả ba engine đọc chung khai báo đó.
+### Khai chính sách riêng
+
+Chính sách mỗi nơi mỗi khác, nên không phải sửa source. Copy
+`tokengate.config.example.json` thành `tokengate.config.json` (hoặc trỏ `TOKENGATE_CONFIG`
+vào file của bạn):
+
+```json
+{
+  "criteria": [
+    {
+      "id": "internal-docs",
+      "name": "Tài liệu nội bộ chưa công bố",
+      "when": "Nội dung trích dẫn lộ trình sản phẩm hoặc số liệu tài chính chưa phát hành.",
+      "unless": "Nội dung chỉ dùng thông tin đã công bố công khai.",
+      "threshold": 0.85,
+      "action": "block",
+      "patterns": [{ "re": "roadmap 2027", "flags": "i" }]
+    }
+  ]
+}
+```
+
+| Trường | Bắt buộc | Ý nghĩa |
+|---|---|---|
+| `id` | có | định danh, không trùng nhau |
+| `when` | có | mệnh đề engine chấm xác suất đúng/sai |
+| `name` | | nhãn hiển thị, bỏ trống thì lấy `id` |
+| `unless` | | mô tả trường hợp âm, giúp engine phân biệt rõ hơn |
+| `threshold` | | ngưỡng kích hoạt trong (0..1], mặc định `0.8` |
+| `action` | | `block` \| `replace` \| `block+log`, mặc định `block` |
+| `patterns` | | regex dự phòng cho engine `local`; chuỗi, hoặc `{ re, flags, score }` |
+
+Có file config thì bộ mặc định bị **thay hoàn toàn**, không cộng dồn.
+
+**Config sai thì server không khởi động.** Cố tình như vậy: im lặng bỏ qua một tiêu chí
+hỏng nghĩa là thủng một lỗ bảo mật mà không ai biết. Lỗi báo rõ file nào, tiêu chí thứ mấy,
+thiếu gì:
+
+```
+[tokengate] không khởi động được: policy.json — tiêu chí #2 (pii): thiếu "when"
+```
 
 ---
 
@@ -223,6 +264,7 @@ fail âm thầm.
 | `LOOKBACK` | `WINDOW_SIZE × 2` | token gần nhất gửi kèm làm ngữ cảnh |
 | `PIPELINE_DEPTH` | `2` | số lượt đánh giá chạy chồng nhau (commit vẫn theo thứ tự) |
 | `SCB_ENGINE` | `auto` | `auto` = Jev nếu có key, không thì local |
+| `TOKENGATE_CONFIG` | `tokengate.config.json` | file chính sách; không có thì dùng 5 tiêu chí mặc định |
 | `JEV_API_KEY` | — | bật engine `jev` |
 | `JEV_URL` | `https://api.typesafe.ai/v1/systemone` | |
 | `JEV_MODEL` | `jev-latest` | xem `GET /v1/models` |
@@ -245,7 +287,7 @@ UPSTREAM_URL=https://api.openai.com/v1/chat/completions UPSTREAM_KEY=sk-... npm 
 | File | Vai trò |
 |---|---|
 | `breaker.js` | Sliding buffer + stream switch controller; kèm bản dựng lại kiến trúc hậu kiểm để đo đối đầu |
-| `criteria.js` | Khai báo 5 tiêu chí: mô tả ngữ nghĩa, ngưỡng, hành động, heuristic dự phòng |
+| `criteria.js` | Tiêu chí mặc định + nạp và kiểm tra `tokengate.config.json` |
 | `evaluator.js` | Chọn và gọi engine; mọi lỗi/timeout đều fallback cục bộ (fail-closed) |
 | `claude-guard.js` | Engine Claude qua Anthropic SDK, strict tool use để ép đúng schema |
 | `upstream.js` | Mock LLM 30–60ms/token + reverse proxy SSE cho endpoint thật |
@@ -254,6 +296,7 @@ UPSTREAM_URL=https://api.openai.com/v1/chat/completions UPSTREAM_KEY=sk-... npm 
 | `public/` | Dashboard split-screen: stream, đồng hồ latency, đèn tiêu chí, đồ thị, bảng so sánh |
 | `proxy.js` | `POST /v1/chat/completions` tương thích OpenAI; phát lại chunk gốc nguyên văn |
 | `test.js` | Self-check lõi bằng `assert`, không framework |
+| `test-config.js` | Test cho việc nạp chính sách: config sai phải ném, không được nuốt |
 | `test-proxy.js` | Test tích hợp: dựng upstream OpenAI giả, gọi proxy qua HTTP thật |
 
 Phụ thuộc duy nhất là `@anthropic-ai/sdk` (cho engine `claude`). Phần lõi — buffer, cầu dao,
@@ -272,13 +315,11 @@ server, dashboard — không dùng thư viện ngoài nào.
 - Proxy chưa có auth và rate-limit — nên đặt sau API gateway sẵn có của bạn, đừng phơi
   thẳng ra ngoài. Chuyển tiếp `Authorization` lên upstream thì có, nhưng nó không xác thực
   chính client gọi vào proxy.
-- Tiêu chí còn hardcode trong `criteria.js`, chưa cấu hình được từ ngoài.
 
 ## Hướng phát triển
 
-- File `tokengate.yaml` để khai tiêu chí riêng, không phải sửa `criteria.js` — hiện tiêu chí
-  vẫn nằm cứng trong source, đây là rào cản lớn nhất để người khác dùng được.
-- Bộ eval 200–500 mẫu có nhãn để biết tỉ lệ chặn nhầm thật.
+- Bộ eval 200–500 mẫu có nhãn để biết tỉ lệ chặn nhầm thật — đây giờ là việc quan trọng nhất
+  còn lại, và nó quan trọng hơn latency.
 - Đặt proxy cùng region với bộ đánh giá để kiểm chứng KPI 35ms trong điều kiện hạ tầng đúng.
 - Đo P50/P95/P99 trên tập tấn công thật thay vì 5 kịch bản dựng sẵn.
 - Ngưỡng theo từng tiêu chí điều chỉnh được lúc chạy, kèm chế độ chỉ gắn cờ cho tiêu chí nhẹ.

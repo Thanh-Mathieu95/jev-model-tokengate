@@ -1,3 +1,4 @@
+import './startup-guard.js';
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';

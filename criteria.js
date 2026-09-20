@@ -1,7 +1,9 @@
+import { readFileSync, existsSync } from 'node:fs';
+
 // Ma trận tiêu chí (mục 3 của spec). `semantic`/`yes`/`no` là câu hỏi noul gửi sang Jev;
 // `local` là heuristic dự phòng khi không có JEV_API_KEY hoặc Jev timeout.
 // action: 'abort' = ngắt luồng, 'replace' = thay bằng cảnh báo, 'abort+log' = ngắt + ghi log bảo mật.
-export const CRITERIA = [
+const DEFAULT_CRITERIA = [
   {
     id: 'CRIT-01',
     name: 'System Prompt Exfiltration',
@@ -82,5 +84,104 @@ export const CRITERIA = [
     ]
   }
 ];
+
+// ---------------------------------------------------------------------------
+// Chính sách khai từ ngoài: tokengate.config.json (hoặc TOKENGATE_CONFIG).
+// Không có file -> dùng bộ mặc định ở trên.
+//
+// Đây là biên giới tin cậy: config sai mà im lặng bỏ qua một tiêu chí nghĩa là
+// thủng một lỗ bảo mật mà không ai biết. Nên mọi lỗi đều NÉM, server không khởi
+// động được, thay vì chạy với chính sách thiếu.
+
+const ACTIONS = { block: 'abort', replace: 'replace', 'block+log': 'abort+log' };
+
+function buildPattern(p, where) {
+  const src = typeof p === 'string' ? p : p?.re;
+  if (typeof src !== 'string' || !src) {
+    throw new Error(`${where}: mỗi phần tử patterns phải là chuỗi regex hoặc { re, flags, score }`);
+  }
+  const score = typeof p === 'string' ? 0.95 : p.score ?? 0.95;
+  if (typeof score !== 'number' || score < 0 || score > 1) {
+    throw new Error(`${where}: score phải là số trong khoảng 0..1`);
+  }
+  try {
+    return [new RegExp(src, typeof p === 'string' ? '' : p.flags ?? ''), score];
+  } catch (err) {
+    throw new Error(`${where}: regex không hợp lệ (${src}) — ${err.message}`);
+  }
+}
+
+/** Kiểm tra và đổi một tiêu chí dạng config sang dạng nội bộ. Ném nếu sai. */
+export function compileCriterion(raw, index, seen = new Set()) {
+  const where = `tiêu chí #${index + 1}${raw?.id ? ` (${raw.id})` : ''}`;
+  if (!raw || typeof raw !== 'object') throw new Error(`${where}: phải là object`);
+
+  const id = raw.id;
+  if (typeof id !== 'string' || !id.trim()) throw new Error(`${where}: thiếu "id"`);
+  if (seen.has(id)) throw new Error(`${where}: "id" bị trùng`);
+  seen.add(id);
+
+  const when = raw.when;
+  if (typeof when !== 'string' || !when.trim()) {
+    throw new Error(`${where}: thiếu "when" — mô tả ngữ nghĩa để engine chấm điểm`);
+  }
+
+  const threshold = raw.threshold ?? 0.8;
+  if (typeof threshold !== 'number' || threshold <= 0 || threshold > 1) {
+    throw new Error(`${where}: "threshold" phải là số trong khoảng (0..1], đang là ${JSON.stringify(raw.threshold)}`);
+  }
+
+  const actionKey = raw.action ?? 'block';
+  if (!(actionKey in ACTIONS)) {
+    throw new Error(`${where}: "action" phải là một trong ${Object.keys(ACTIONS).join(', ')} — đang là ${JSON.stringify(actionKey)}`);
+  }
+
+  if (raw.patterns !== undefined && !Array.isArray(raw.patterns)) {
+    throw new Error(`${where}: "patterns" phải là mảng`);
+  }
+
+  return {
+    id,
+    name: raw.name ?? id,
+    semantic: when,
+    yes: when,
+    no: raw.unless ?? `Nội dung không thuộc trường hợp: ${when}`,
+    action: ACTIONS[actionKey],
+    threshold,
+    local: (raw.patterns ?? []).map((p, i) => buildPattern(p, `${where} patterns[${i}]`))
+  };
+}
+
+/** Đổi cả file config. Ném kèm tên file để người dùng biết sửa ở đâu. */
+export function compileConfig(cfg, source = 'config') {
+  if (!cfg || typeof cfg !== 'object') throw new Error(`${source}: nội dung phải là object JSON`);
+  if (!Array.isArray(cfg.criteria) || cfg.criteria.length === 0) {
+    throw new Error(`${source}: cần mảng "criteria" có ít nhất một phần tử`);
+  }
+  const seen = new Set();
+  return cfg.criteria.map((c, i) => {
+    try {
+      return compileCriterion(c, i, seen);
+    } catch (err) {
+      throw new Error(`${source} — ${err.message}`);
+    }
+  });
+}
+
+function loadOverride() {
+  const path = process.env.TOKENGATE_CONFIG || 'tokengate.config.json';
+  if (!existsSync(path)) return null;
+  let cfg;
+  try {
+    cfg = JSON.parse(readFileSync(path, 'utf8'));
+  } catch (err) {
+    throw new Error(`${path}: không phải JSON hợp lệ — ${err.message}`);
+  }
+  const compiled = compileConfig(cfg, path);
+  console.error(`[tokengate] nạp ${compiled.length} tiêu chí từ ${path}`);
+  return compiled;
+}
+
+export const CRITERIA = loadOverride() ?? DEFAULT_CRITERIA;
 
 export const BY_ID = Object.fromEntries(CRITERIA.map((c) => [c.id, c]));

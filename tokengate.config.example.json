@@ -1,0 +1,51 @@
+{
+  "_": "Đổi tên file này thành tokengate.config.json (hoặc trỏ TOKENGATE_CONFIG vào nó) để thay bộ tiêu chí mặc định. Có file này thì bộ mặc định bị thay HOÀN TOÀN, không cộng dồn.",
+
+  "criteria": [
+    {
+      "id": "secret-leak",
+      "name": "Rò rỉ khóa và thông tin xác thực",
+      "when": "Nội dung chứa giá trị bí mật thật: khóa API, private key, JWT, mật khẩu, connection string.",
+      "unless": "Nội dung chỉ nhắc tên biến hoặc nói về bảo mật chung chung, không lộ giá trị bí mật nào.",
+      "threshold": 0.8,
+      "action": "block",
+      "patterns": [
+        "\\bsk-[A-Za-z0-9_-]{2,}",
+        "-----BEGIN [A-Z ]*PRIVATE KEY",
+        { "re": "\\b(api[_\\s-]?key|password|mật\\s*khẩu)\\b\\s*[:=]\\s*[\"'`]?\\S{4,}", "flags": "i", "score": 0.9 }
+      ]
+    },
+    {
+      "id": "customer-pii",
+      "name": "Lộ thông tin cá nhân khách hàng",
+      "when": "Nội dung đọc ra thông tin định danh cá nhân của người khác: số căn cước, số thẻ tín dụng, bệnh án.",
+      "unless": "Nội dung không chứa dữ liệu định danh của bất kỳ cá nhân cụ thể nào.",
+      "threshold": 0.8,
+      "action": "block",
+      "patterns": [
+        { "re": "\\b(cccd|cmnd|căn cước)\\b\\s*[:=]?\\s*\\d{4,}", "flags": "i" },
+        "\\b(?:\\d[ -]?){15,18}\\b"
+      ]
+    },
+    {
+      "id": "pricing-commit",
+      "name": "Cam kết giá chưa được ủy quyền",
+      "when": "Nội dung đưa ra cam kết tài chính cụ thể chưa được ủy quyền: giảm giá lớn, hoàn tiền vô điều kiện, bảo hành trọn đời.",
+      "unless": "Nội dung chỉ mô tả chính sách sẵn có hoặc hướng dẫn khách liên hệ bộ phận có thẩm quyền.",
+      "threshold": 0.85,
+      "action": "replace",
+      "patterns": [
+        { "re": "(giảm|discount)\\s*(giá\\s*)?[2-9]\\d\\s*%", "flags": "i", "score": 0.92 },
+        { "re": "hoàn\\s*(lại\\s*)?tiền\\s*(100\\s*%|vô\\s*điều\\s*kiện)", "flags": "i" }
+      ]
+    },
+    {
+      "id": "internal-docs",
+      "name": "Tài liệu nội bộ chưa công bố",
+      "when": "Nội dung trích dẫn tài liệu nội bộ chưa công bố: lộ trình sản phẩm, biên bản họp, số liệu tài chính chưa phát hành.",
+      "unless": "Nội dung chỉ dùng thông tin đã công bố công khai.",
+      "threshold": 0.85,
+      "action": "block+log"
+    }
+  ]
+}
