@@ -2,81 +2,63 @@
 
 > Every token passes the gate before the screen.
 
-Proxy tương thích OpenAI, đặt giữa LLM và người dùng. Nó kiểm duyệt ngữ nghĩa **từng cửa sổ
-token trong lúc đang stream** và ngắt luồng **trước khi** token vi phạm kịp hiển thị.
+An OpenAI-compatible proxy that sits between your LLM and your users. It evaluates each
+sliding window of tokens **while the response is still streaming** and cuts the stream
+**before** a violating token can reach the screen.
 
 ```
 LLM ──stream──► [ sliding buffer ] ──► [ gate ] ──► client
-                  token đang chờ         │
-                                    chặn tại đây
+                 tokens pending          │
+                                    blocked here
 ```
 
-![tokengate race benchmark](docs/race.png)
+![race benchmark](docs/race.png)
 
-Cùng một prompt tấn công, hai kiến trúc chạy song song. **Trái (hậu kiểm):** khóa API
-`sk-proj-...` và `DB_PASSWORD` hiện đầy đủ trên màn hình, 2.98 giây sau mới có thông báo
-"Nội dung đã bị xóa" — 173 ký tự đã lộ. **Phải (tokengate):** luồng ngắt ngay trong buffer,
-**0 ký tự rò rỉ**.
+Same attack prompt, two architectures side by side. **Left (post-hoc):** the API key
+`sk-proj-...` and `DB_PASSWORD` render in full, and the "content removed" notice arrives
+2.98s later — 173 characters already leaked. **Right (tokengate):** the stream is cut inside
+the buffer. **0 characters leaked.**
 
 ---
 
-## Mục tiêu dự án
+## The problem
 
-### Vấn đề
+LLM apps stream tokens to the screen as they are generated (30–60ms/token) to cut
+time-to-first-token. Conventional guardrails are **post-hoc**: they buffer a sentence, send it
+to a second LLM (Llama-Guard, GPT-4o-mini), wait 850–1600ms, then order a redaction. By then
+18–35 sensitive tokens have been on screen. The user has read them, screenshotted them, or
+recorded them.
 
-Ứng dụng LLM ngày nay stream chữ ra màn hình ngay khi model sinh (30–60ms/token) để giảm
-Time-to-First-Token. Cơ chế đó tạo một lỗ hổng không vá được bằng kiểm duyệt thông thường.
+The industry builds a **detective** control and sells it as a **preventive** one.
 
-Guardrail truyền thống là **hậu kiểm** — gom câu, gửi sang một LLM phụ (Llama-Guard,
-GPT-4o-mini), chờ 850–1600ms rồi mới ra lệnh chặn. Trong khoảng chờ đó, 18–35 token nhạy cảm
-đã hiện trên màn hình: khóa API, system prompt, PII, cam kết pháp lý sai. Lệnh xóa đến sau
-không cứu được gì — người dùng đã đọc, đã kịp chụp màn hình, video ghi hình đã quay xong.
+> **Deleting a secret from the screen is not security. Keeping it off the screen is.**
 
-Nói cách khác: cả ngành đang xây **biện pháp phát hiện** rồi bán nó như **biện pháp ngăn chặn**.
+## The solution
 
-> **Xóa một bí mật khỏi màn hình không phải là bảo mật. Không để nó lên màn hình mới là.**
+Don't moderate faster — moderate **before release**. Tokens leaving the LLM are held in a small
+sliding buffer, pending verification. When the buffer fills, the full criteria matrix is scored
+in parallel; only on *All Pass* is that batch released. On a violation the buffer is dropped,
+the client stream is cut, and an abort is sent upstream so you stop paying for generation.
 
-### Giải pháp
+The consequence that matters: **leakage is independent of evaluator latency.** A slow engine
+makes the stream stutter; it does not leak a single extra token.
 
-Không kiểm duyệt nhanh hơn — kiểm duyệt **trước khi phát hành**. Token ra khỏi LLM không đi
-thẳng tới client mà nằm trong một buffer trượt nhỏ ở trạng thái *chờ xác minh*. Mỗi khi buffer
-đầy, toàn bộ ma trận tiêu chí được chấm song song; chỉ khi *All Pass* thì lô token đó mới
-được thả. Vi phạm → buffer bị huỷ, luồng bị ngắt, và một tín hiệu abort gửi ngược lên LLM để
-khỏi trả tiền cho phần sinh thừa.
+## Results
 
-Hệ quả kiến trúc quan trọng nhất: **mức rò rỉ không phụ thuộc vào tốc độ của bộ kiểm duyệt.**
-Engine chậm chỉ làm luồng khựng lâu hơn, không làm lọt thêm một token nào. Đó là khác biệt
-bản chất so với hậu kiểm, nơi mỗi mili-giây trễ là thêm một ký tự bí mật lên màn hình.
-
-### Mục tiêu đo được, và kết quả thật
-
-| Mục tiêu | Ngưỡng | Kết quả đo | |
+| Goal | Target | Measured | |
 |---|---|---|---|
-| **Zero Leakage** — token nhạy cảm hiển thị trên UI | 0 | **0** trên 5 kịch bản × 3 engine | ✅ |
-| **Schema Reliability** — phản hồi kiểm duyệt đúng cấu trúc | 100% | **100%** (Jev: noul 0–1; Claude: strict tool use) | ✅ |
-| **Phân loại đúng** trên bộ kịch bản | — | **5/5** cả ba engine | ✅ |
-| **Inline Interception Latency** | ≤ 35ms/lượt | **~300ms** (Jev, qua internet công cộng; đo lặp 277–345ms) | ❌ |
+| **Zero leakage** — sensitive tokens rendered | 0 | **0** across 5 scenarios × 3 engines | ✅ |
+| **Schema reliability** — well-formed verdicts | 100% | **100%** (Jev noul 0–1; Claude strict tool use) | ✅ |
+| **Classification** on the scenario set | — | **5/5** on all three engines | ✅ |
+| **Interception latency** | ≤ 35ms | **~300ms** (Jev over the public internet, 277–345ms) | ❌ |
 
-Về KPI độ trễ, nói thẳng: **không đạt, và không đạt được bằng cách tối ưu code.** Đo tách bạch
-cho thấy compute phía Jev chỉ ~79ms, còn ~190ms là RTT mạng từ VN tới endpoint. Muốn chạm 35ms
-phải đặt proxy cùng region/edge node với bộ đánh giá. Con số trong repo này là số thật đo trên
-máy thường, không phải số trong slide.
-
-### Ngoài phạm vi
-
-Dự án **không** cố trở thành guardrail đa năng đặt trước mọi traffic. Nó là **van chặn cho một
-bề mặt hẹp, rủi ro cao, có người đang nhìn**. Và cần nói rõ nó không giải quyết gì:
-
-- **Không ngăn model sinh ra nội dung xấu**, chỉ ngăn nội dung đó tới màn hình.
-- **Không sửa lỗi phân quyền.** Nếu bot RAG đọc được hồ sơ nó không nên đọc, gốc rễ nằm ở tầng
-  dữ liệu. Đây là lưới an toàn cuối cùng, không phải bản vá.
-- **Không giải quyết prompt injection**, chỉ chặn một trong các hậu quả của nó.
-- **Vô dụng khi đầu ra cho máy đọc.** Không có mắt người thì gom cả response kiểm một lần rẻ hơn
-  nhiều — proxy tự đi đường đó khi `stream: false`.
+The latency target is **missed, and not fixable in code**. Broken down: ~79ms is Jev compute,
+~190ms is network RTT from Vietnam. Hitting 35ms requires colocating the proxy with the
+evaluator. These are real numbers from an ordinary machine, not slideware.
 
 ---
 
-## Cắm vào ứng dụng có sẵn
+## Use it
 
 ```bash
 docker build -t tokengate . && docker run -p 8787:8787 \
@@ -85,154 +67,123 @@ docker build -t tokengate . && docker run -p 8787:8787 \
   tokengate
 ```
 
-Rồi sửa **đúng một dòng** trong ứng dụng đang chạy:
+Then change **one line** in your existing app:
 
 ```python
-client = OpenAI(base_url="http://localhost:8787/v1")   # thay vì api.openai.com
+client = OpenAI(base_url="http://localhost:8787/v1")   # instead of api.openai.com
 ```
 
-Hết. Không sửa logic, không đổi SDK. `POST /v1/chat/completions` nói đúng wire format OpenAI,
-và chunk gốc được **phát lại nguyên văn** sau khi xác minh chứ không dựng lại — nên `id`,
-`usage`, `finish_reason`, `tool_calls` đều còn nguyên.
+That's it. Upstream chunks are **replayed verbatim** after verification rather than rebuilt, so
+`id`, `usage`, `finish_reason` and `tool_calls` all survive.
 
-Ba điều đáng biết:
+- **A violation yields `finish_reason: "content_filter"`** then `[DONE]` — standard OpenAI, so
+  existing SDKs handle it. Better than killing the socket mid-response.
+- **`tool_calls` are inspected too.** A model can hide a key in a function argument, so the gate
+  reads `function.arguments`, not just `content`.
+- **`stream: false` takes the cheap path:** buffer the whole response, evaluate once.
 
-- **Vi phạm → `finish_reason: "content_filter"`** rồi `[DONE]`, đúng quy ước OpenAI nên SDK có
-  sẵn xử lý được. Tốt hơn nhiều so với cắt socket giữa chừng.
-- **`tool_calls` cũng bị soi.** Model hoàn toàn có thể nhét khóa vào argument của function —
-  cầu dao đọc cả `function.arguments`, không chỉ `content`.
-- **`stream: false` đi đường rẻ:** gom cả response, kiểm một lần.
+Without `UPSTREAM_KEY` the proxy forwards the client's `Authorization` header, so it can serve
+multiple tenants while holding no keys of its own.
 
-Không set `UPSTREAM_KEY` thì proxy chuyển tiếp header `Authorization` của client — dùng được
-cho nhiều tenant mà proxy không giữ khóa nào.
+> The proxy does **not** authenticate its own callers. Put it behind your existing API gateway.
 
-> **Proxy chưa tự xác thực client gọi vào.** Đặt nó sau API gateway sẵn có của bạn (auth, rate
-> limit, routing), đừng phơi thẳng ra internet.
-
----
-
-## Xem nó hoạt động
+## See it
 
 ```bash
-npm install
-npm start          # http://localhost:8787
+npm install && npm start     # http://localhost:8787
 ```
 
-Chạy được ngay không cần API key nào — mặc định dùng mock LLM và heuristic cục bộ. Dashboard
-có hai nút:
-
-- **▶ Chạy đối đầu** — cùng một prompt tấn công chạy song song qua hậu kiểm (trái) và tiền kiểm
-  (phải). Bên trái khóa API hiện lên rồi mới bị xóa; bên phải luồng dừng trước khi ký tự đầu
-  tiên của khóa kịp ra.
-- **⚖ So mọi engine** — chạy toàn bộ benchmark ngay trên server, kết quả đổ về bảng từng dòng.
+Runs with no API key at all — mock LLM plus the local heuristic. The dashboard has two
+buttons: *Chạy đối đầu* races post-hoc against inline on the same prompt, and *So mọi engine*
+runs the full benchmark server-side, streaming results into a table row by row.
 
 ```bash
-npm test                   # lõi + config + proxy (offline, tất định, không tốn credit)
-SCB_TEST_JEV=1 npm test    # thêm smoke test gọi Jev thật
-node bench.js              # benchmark bản CLI
-node bench.js local claude # chỉ so 2 engine được nêu
+npm test                   # core + config + proxy (offline, deterministic, no credits)
+SCB_TEST_JEV=1 npm test    # plus a live Jev smoke test
+node bench.js              # CLI benchmark
 ```
 
 ---
 
-## Ba engine kiểm duyệt
+## Engines
 
-Cùng một cầu dao, thay engine không đổi một dòng nào ở tầng luồng — cả ba trả về 5 score 0–1
-so với `threshold`. Chọn bằng dropdown **Engine B**, tham số `?engine=`, hoặc `SCB_ENGINE`.
+One gate, swappable engines — all three return five 0–1 scores compared against `threshold`.
+Select via the **Engine B** dropdown, `?engine=`, or `SCB_ENGINE`.
 
-| Engine | Cơ chế | p50 trung vị | Đúng | Rò rỉ |
+| Engine | Mechanism | median p50 | Correct | Leaked |
 |---|---|---|---|---|
 | `local` | regex | **0.03 ms** | 5/5 | 0 |
-| `jev` | TypeSafe Jev, latent space, 1 call cho cả 5 tiêu chí | **308 ms** | 5/5 | 0 |
-| `claude` (haiku-4-5) | LLM guardrail, strict tool use | **1 554 ms** | 5/5 | 0 |
-| `claude` (opus-5) | LLM guardrail, strict tool use | **2 746 ms** | 5/5* | 0 |
+| `jev` | TypeSafe Jev, latent space, one call for all 5 criteria | **308 ms** | 5/5 | 0 |
+| `claude` (haiku-4-5) | LLM guardrail, strict tool use | **1,554 ms** | 5/5 | 0 |
+| `claude` (opus-5) | LLM guardrail, strict tool use | **2,746 ms** | 5/5\* | 0 |
 
-`local` là fallback, không hiểu ngữ nghĩa — nó tồn tại để demo chạy offline và để hệ thống
-không fail-open khi engine ngoài chết.
+`local` is a fallback, not a moderator — it exists so the demo runs offline and so the system
+never fails open when a remote engine dies.
 
-![so sánh engine](docs/bench.png)
+![engine comparison](docs/bench.png)
 
-Bảng trên là ảnh chụp thật một lượt chạy (nút **⚖ So mọi engine**), 15 lượt = 3 engine × 5
-kịch bản. Hàng `claude` (haiku-4-5) đo ở lượt riêng nên không có trong ảnh.
+The *Leaked* column is green for every engine even though p50 spans **five orders of
+magnitude**. That is the architectural claim, and this is the measurement backing it.
 
-Điều đáng nhìn nhất: cột *Rò rỉ* xanh hết ở cả ba engine, dù p50 chênh nhau **gần 100 000 lần**
-(0.03ms so với 2 746ms). Đó chính là luận điểm kiến trúc, và đây là số đo chứng minh nó.
+### Finding: the guardrail refuses to guard
 
-### Phát hiện đáng chú ý: guardrail tự từ chối
+The `*` on Opus 5: on the `harmful` scenario Claude returned `stop_reason: "refusal"`
+(category `cyber`) — its own safety classifier blocked it from even *evaluating* zero-day
+exploit content. The guardrail fell back to the local heuristic, so that cell passed on the
+fallback, not on Claude.
 
-`*` ở dòng Opus 5: trên kịch bản `harmful`, Claude trả `stop_reason: "refusal"` (category
-`cyber`) — bộ phân loại an toàn của chính nó chặn cả việc **đánh giá** nội dung khai thác
-zero-day. Guardrail rơi về heuristic cục bộ; ô đó đúng là nhờ fallback đỡ, không nhờ Claude.
-
-Trong ảnh trên, đó là ô cam duy nhất: cột *Đã chạy thật* ghi `claude+local` thay vì `claude`,
-và bảng tổng kết ghi claude *Phải fallback: 1*.
-
-Đây là rủi ro hệ thống khi lấy LLM đa dụng làm kiểm duyệt: **nội dung càng nguy hiểm, engine
-càng dễ bỏ chạy** — đúng lúc cần nhất, và bỏ chạy im lặng nếu hệ thống không bắt lỗi fallback.
-Model phân loại chuyên dụng (Jev) và model nhỏ (Haiku 4.5) không có hành vi này.
+This is a systemic risk of using a general-purpose LLM as a moderator: **the more dangerous the
+content, the more likely the engine walks away** — exactly when you need it, and silently if you
+don't surface fallbacks. A dedicated classifier (Jev) and a small model (Haiku 4.5) did not do
+this.
 
 ---
 
-## Chi phí trên câu trả lời dài
+## Cost on long responses
 
-Đây là chỗ một guardrail streaming sống hoặc chết, và nó không lộ ra ở demo ngắn. Gọi
-evaluator lặp lại trên văn bản đang dài ra rất dễ thành chi phí bậc hai.
+Calling an evaluator repeatedly over a growing text is quadratic if done naively — the trap
+that short demos hide. tokengate avoids it three ways: each pass sends only `LOOKBACK` recent
+tokens plus the current batch; upstream reading runs concurrently with evaluation
+(`PIPELINE_DEPTH` overlapping passes, **committed in order**, so the zero-leak guarantee is
+unchanged); and batches grow when the evaluator is slow (`MAX_CHUNK`), so cost shrinks instead
+of exploding.
 
-tokengate làm ba việc để tránh:
+400-token response, 40ms/token, measured 19.3s baseline:
 
-1. **Mỗi lượt chỉ gửi `LOOKBACK` token gần nhất + lô đang xét**, không gửi lại cả bài.
-2. **Đọc upstream chạy song song với đánh giá**, và `PIPELINE_DEPTH` lượt đánh giá được phép
-   chồng nhau — nhưng **commit theo đúng thứ tự**, nên bảo đảm 0 rò rỉ không đổi.
-3. **Lô tự to ra khi evaluator chậm** (`MAX_CHUNK`): evaluator càng chậm thì số lượt gọi càng
-   ít, chi phí tự co lại thay vì bùng lên.
-
-Đo trên câu trả lời 400 token, sinh 40ms/token, baseline đo thật 19.3s:
-
-| evaluator | | lượt gọi | ký tự gửi đi | độ trễ cộng thêm |
+| Evaluator | | Calls | Chars sent | Added latency |
 |---|---|---|---|---|
-| Jev 300ms | ngây thơ | 50 | 56 278 (24.6x bài gốc) | +0.30s |
-| Jev 300ms | **tokengate** | 50 | **6 726 (2.9x)** | **+0.11s** |
-| Opus 2 700ms | ngây thơ | 50 | 56 278 (24.6x) | +116.51s |
-| Opus 2 700ms | **tokengate** | **15** | **3 522 (1.5x)** | **+2.78s** |
+| Jev 300ms | naive | 50 | 56,278 (24.6× the text) | +0.30s |
+| Jev 300ms | **tokengate** | 50 | **6,726 (2.9×)** | **+0.11s** |
+| Opus 2,700ms | naive | 50 | 56,278 (24.6×) | +116.51s |
+| Opus 2,700ms | **tokengate** | **15** | **3,522 (1.5×)** | **+2.78s** |
 
-("ngây thơ" = gửi toàn bộ ngữ cảnh, không gộp lô, không pipeline — mô phỏng bằng
-`maxChunk=windowSize, lookback=Infinity, depth=1`. Bản ngây thơ thật còn chặn cả việc đọc
-upstream trong lúc đánh giá, nên số thật của nó còn tệ hơn bảng này.)
+("naive" = full context, no batching, no pipeline, simulated via
+`maxChunk=windowSize, lookback=Infinity, depth=1`. A truly naive version also blocks upstream
+reads during evaluation, so its real numbers are worse than shown.)
 
-Điểm cần thấy: với Jev thì cổng gần như miễn phí. Với evaluator chậm gấp 9 lần, nó **vẫn dùng
-được** — +2.78s thay vì +116s. Đó là điều làm kiến trúc này chịu được engine kém.
-
-**Đánh đổi phải biết:** cửa sổ trượt cố định nghĩa là vi phạm chỉ nhận ra khi đọc toàn bài sẽ
-lọt. Tăng `LOOKBACK` nếu chính sách của bạn cần ngữ cảnh xa — đổi lại chi phí tăng.
+With Jev the gate is essentially free. With an engine 9× slower it is still usable — +2.78s
+instead of +116s. **Trade-off:** a fixed window means violations only visible across the whole
+response will slip through. Raise `LOOKBACK` at the cost of throughput.
 
 ---
 
-## Bộ tiêu chí
+## Criteria
 
-Mặc định có 5 tiêu chí, cả ba engine đọc chung một khai báo:
+Five by default, shared by all engines: system-prompt exfiltration, secret/credential leak,
+unauthorized pricing commitments (replaced rather than cut), PII disclosure, and harmful
+instructions (cut plus security log).
 
-| Mã | Tiêu chí | Hành động khi kích hoạt |
-|---|---|---|
-| CRIT-01 | System Prompt Exfiltration | ngắt luồng |
-| CRIT-02 | Secret & Credential Leak | ngắt luồng |
-| CRIT-03 | Unauthorized Legal/Pricing Commit | thay bằng cảnh báo |
-| CRIT-04 | PII Disclosure | ngắt luồng |
-| CRIT-05 | Harmful/Dangerous Instructions | ngắt luồng + ghi log bảo mật |
-
-### Khai chính sách riêng
-
-Chính sách mỗi nơi mỗi khác, nên không phải sửa source. Copy
-`tokengate.config.example.json` thành `tokengate.config.json` (hoặc trỏ `TOKENGATE_CONFIG`
-vào file của bạn):
+Policies differ per deployment, so they live outside the source. Copy
+`tokengate.config.example.json` to `tokengate.config.json`, or point `TOKENGATE_CONFIG` at your
+own file:
 
 ```json
 {
   "criteria": [
     {
       "id": "internal-docs",
-      "name": "Tài liệu nội bộ chưa công bố",
-      "when": "Nội dung trích dẫn lộ trình sản phẩm hoặc số liệu tài chính chưa phát hành.",
-      "unless": "Nội dung chỉ dùng thông tin đã công bố công khai.",
+      "when": "The content quotes an unpublished roadmap or unreleased financial figures.",
+      "unless": "The content only uses publicly announced information.",
       "threshold": 0.85,
       "action": "block",
       "patterns": [{ "re": "roadmap 2027", "flags": "i" }]
@@ -241,90 +192,53 @@ vào file của bạn):
 }
 ```
 
-| Trường | Bắt buộc | Ý nghĩa |
-|---|---|---|
-| `id` | có | định danh, không trùng nhau |
-| `when` | có | mệnh đề engine chấm xác suất đúng/sai |
-| `name` | | nhãn hiển thị, bỏ trống thì lấy `id` |
-| `unless` | | mô tả trường hợp âm, giúp engine phân biệt rõ hơn |
-| `threshold` | | ngưỡng kích hoạt trong (0..1], mặc định `0.8` |
-| `action` | | `block` \| `replace` \| `block+log`, mặc định `block` |
-| `patterns` | | regex dự phòng cho engine `local`; chuỗi, hoặc `{ re, flags, score }` |
+`id` and `when` are required. `name` defaults to `id`, `threshold` to `0.8`, `action` to
+`block` (`block` | `replace` | `block+log`). `patterns` are regex fallbacks for the `local`
+engine — a string, or `{ re, flags, score }`. A config file **replaces** the defaults entirely.
 
-Có file config thì bộ mặc định bị **thay hoàn toàn**, không cộng dồn.
-
-**Config sai thì server không khởi động.** Cố tình như vậy: im lặng bỏ qua một tiêu chí hỏng
-nghĩa là thủng một lỗ bảo mật mà không ai biết. Lỗi báo rõ file nào, tiêu chí thứ mấy, thiếu gì:
-
-```
-[tokengate] không khởi động được: policy.json — tiêu chí #2 (pii): thiếu "when"
-```
+**A bad config refuses to start the server.** Deliberately: silently dropping a malformed
+criterion is a security hole nobody knows about. Startup errors name the file, the criterion
+index and the offending field. (Runtime messages and source comments are in Vietnamese.)
 
 ---
 
-## Cấu hình
+## Configuration
 
-Copy `.env.example` sang `.env` rồi điền. Thiếu key nào thì engine đó tự tắt trên UI, không
-fail âm thầm.
-
-| Biến | Mặc định | Ghi chú |
+| Variable | Default | Notes |
 |---|---|---|
 | `PORT` | `8787` | |
-| `WINDOW_SIZE` | `8` | số token tối thiểu gom lại trước mỗi lượt đánh giá |
-| `MAX_CHUNK` | `WINDOW_SIZE × 4` | trần token mỗi lượt; evaluator chậm → lô to hơn, gọi ít hơn |
-| `LOOKBACK` | `WINDOW_SIZE × 2` | token gần nhất gửi kèm làm ngữ cảnh |
-| `PIPELINE_DEPTH` | `2` | số lượt đánh giá chạy chồng nhau (commit vẫn theo thứ tự) |
-| `SCB_ENGINE` | `auto` | `auto` = Jev nếu có key, không thì local |
-| `TOKENGATE_CONFIG` | `tokengate.config.json` | file chính sách; không có thì dùng 5 tiêu chí mặc định |
-| `JEV_API_KEY` | — | bật engine `jev` |
-| `JEV_URL` | `https://api.typesafe.ai/v1/systemone` | |
-| `JEV_MODEL` | `jev-latest` | xem `GET /v1/models` |
-| `JEV_TIMEOUT_MS` | `1500` | quá ngưỡng → fallback cục bộ, **không** mở cửa luồng |
-| `ANTHROPIC_API_KEY` | — | bật engine `claude` |
-| `CLAUDE_MODEL` | `claude-opus-5` | `claude-haiku-4-5` để so ở tầng guardrail nhanh/rẻ |
-| `CLAUDE_TIMEOUT_MS` | `20000` | |
-| `UPSTREAM_URL` / `UPSTREAM_KEY` / `UPSTREAM_MODEL` | — | không set → mock LLM |
+| `WINDOW_SIZE` | `8` | minimum tokens buffered per evaluation |
+| `MAX_CHUNK` | `WINDOW_SIZE × 4` | ceiling per pass; slower engine → bigger batches, fewer calls |
+| `LOOKBACK` | `WINDOW_SIZE × 2` | recent tokens sent as context |
+| `PIPELINE_DEPTH` | `2` | overlapping evaluations (commit stays in order) |
+| `SCB_ENGINE` | `auto` | `auto` = Jev when keyed, else local |
+| `TOKENGATE_CONFIG` | `tokengate.config.json` | policy file; absent → built-in criteria |
+| `JEV_API_KEY` / `JEV_URL` / `JEV_MODEL` | — / `…/v1/systemone` / `jev-latest` | enables `jev` |
+| `JEV_TIMEOUT_MS` | `1500` | on timeout → local fallback, never fail-open |
+| `ANTHROPIC_API_KEY` / `CLAUDE_MODEL` | — / `claude-opus-5` | enables `claude` |
+| `UPSTREAM_URL` / `UPSTREAM_KEY` / `UPSTREAM_MODEL` | — | unset → mock LLM |
 
----
+Core files: `breaker.js` (buffer + switch), `proxy.js` (OpenAI wire format), `criteria.js`
+(policy loading and validation), `evaluator.js` (engine selection, fail-closed),
+`claude-guard.js`, `upstream.js`, `bench.js`, `server.js`, `public/` (dashboard), and three
+`test*.js` files using plain `assert`. The only dependency is `@anthropic-ai/sdk`, needed for
+the `claude` engine; everything else is stdlib.
 
-## Cấu trúc mã
+## Known limits
 
-| File | Vai trò |
-|---|---|
-| `breaker.js` | Sliding buffer + stream switch controller; kèm bản dựng lại kiến trúc hậu kiểm để đo đối đầu |
-| `proxy.js` | `POST /v1/chat/completions` tương thích OpenAI; phát lại chunk gốc nguyên văn |
-| `criteria.js` | Tiêu chí mặc định + nạp và kiểm tra `tokengate.config.json` |
-| `evaluator.js` | Chọn và gọi engine; mọi lỗi/timeout đều fallback cục bộ (fail-closed) |
-| `claude-guard.js` | Engine Claude qua Anthropic SDK, strict tool use để ép đúng schema |
-| `upstream.js` | Mock LLM 30–60ms/token + đọc SSE của endpoint thật |
-| `bench.js` | Benchmark dùng chung cho CLI và `/api/bench` |
-| `server.js` | Route proxy + SSE demo + static |
-| `startup-guard.js` | Đổi stack trace lúc nạp config thành một dòng đọc được |
-| `public/` | Dashboard split-screen: stream, đồng hồ latency, đèn tiêu chí, đồ thị, bảng so sánh |
-| `test.js` / `test-config.js` / `test-proxy.js` | Self-check bằng `assert`, không framework |
+- **The false-positive rate is unmeasured.** Five scenarios are not an eval set. A guardrail
+  that truncates 1% of legitimate answers is worse than none. This matters more than latency.
+- **`local` is regex**, a safety net rather than a moderator.
+- **Fixed sliding window** — violations only apparent across the whole response slip through.
+- **No auth or rate limiting** on the proxy; it belongs behind a gateway.
+- **The 35ms target is untested** without infrastructure colocated with the evaluator.
 
-Phụ thuộc duy nhất là `@anthropic-ai/sdk` (cho engine `claude`). Phần lõi — buffer, cầu dao,
-proxy, server, dashboard — không dùng thư viện ngoài nào.
+## Roadmap
 
----
+A labelled eval set of 200–500 real responses to measure false positives; colocated deployment
+to test the latency target honestly; packaging as a filter for existing LLM gateways (LiteLLM,
+Portkey) instead of another service to run; runtime-tunable thresholds with a flag-only mode.
 
-## Giới hạn đã biết
+## License
 
-- **Chưa biết tỉ lệ chặn nhầm thật.** 5 kịch bản không phải eval set. Một guardrail chặn nhầm
-  1% câu trả lời hợp lệ — cụt giữa chừng — thì tệ hơn là không có. Đây là con số quan trọng
-  nhất còn thiếu, và nó quan trọng hơn latency.
-- **`local` là regex, không phải hiểu ngữ nghĩa.** Nó là lưới an toàn, không phải bộ kiểm duyệt.
-- **Cửa sổ trượt cố định**: vi phạm chỉ nhận ra khi đọc toàn bài sẽ lọt. `LOOKBACK` là núm vặn.
-- **Proxy chưa có auth và rate-limit**, phải đặt sau API gateway sẵn có.
-- **KPI 35ms chưa kiểm chứng được** vì chưa có hạ tầng cùng region với bộ đánh giá.
-
-## Hướng phát triển
-
-- Bộ eval 200–500 mẫu có nhãn (một nửa vô hại, một nửa tấn công) để đo tỉ lệ chặn nhầm.
-- Đặt proxy cùng region với bộ đánh giá để kiểm chứng KPI 35ms trong điều kiện hạ tầng đúng.
-- Đóng gói thành filter cho LLM gateway sẵn có (LiteLLM, Portkey) thay vì bắt dựng thêm service.
-- Ngưỡng điều chỉnh được lúc chạy, kèm chế độ chỉ gắn cờ cho tiêu chí nhẹ.
-
-## Giấy phép
-
-MIT — xem [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).
