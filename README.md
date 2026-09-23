@@ -101,6 +101,7 @@ runs the full benchmark server-side, streaming results into a table row by row.
 npm test                   # core + config + proxy (offline, deterministic, no credits)
 SCB_TEST_JEV=1 npm test    # plus a live Jev smoke test
 node bench.js              # CLI benchmark
+node eval.js               # false-positive rate on labelled hard cases
 ```
 
 ---
